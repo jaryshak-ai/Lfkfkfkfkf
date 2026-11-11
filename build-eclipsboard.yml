@@ -1,0 +1,567 @@
+name: Build EclipsBoard
+
+on:
+  push:
+    paths:
+      - '.github/workflows/build-eclipsboard.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Create sources and build
+        run: |
+          set -e
+          mkdir -p EclipsBoard
+          cd EclipsBoard
+          mkdir -p $(dirname pom.xml)
+          cat > pom.xml <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+              <modelVersion>4.0.0</modelVersion>
+
+              <groupId>eclipsboard</groupId>
+              <artifactId>EclipsBoard</artifactId>
+              <version>1.0.0</version>
+              <packaging>jar</packaging>
+
+              <properties>
+                  <maven.compiler.source>17</maven.compiler.source>
+                  <maven.compiler.target>17</maven.compiler.target>
+                  <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+              </properties>
+
+              <repositories>
+                  <repository>
+                      <id>lanink</id>
+                      <url>https://repo.lanink.cn/repository/maven-public/</url>
+                  </repository>
+              </repositories>
+
+              <dependencies>
+                  <dependency>
+                      <groupId>cn.nukkit</groupId>
+                      <artifactId>Nukkit</artifactId>
+                      <version>MOT-SNAPSHOT</version>
+                      <scope>provided</scope>
+                  </dependency>
+              </dependencies>
+
+              <build>
+                  <finalName>EclipsBoard-${project.version}</finalName>
+                  <plugins>
+                      <plugin>
+                          <groupId>org.apache.maven.plugins</groupId>
+                          <artifactId>maven-compiler-plugin</artifactId>
+                          <version>3.11.0</version>
+                          <configuration>
+                              <release>17</release>
+                              <encoding>UTF-8</encoding>
+                          </configuration>
+                      </plugin>
+                  </plugins>
+              </build>
+          </project>
+          EOF
+          mkdir -p $(dirname src/main/resources/plugin.yml)
+          cat > src/main/resources/plugin.yml <<'EOF'
+          name: EclipsBoard
+          main: eclipsboard.EclipsBoard
+          version: "1.0.0"
+          api: ["1.0.0"]
+          author: jaryshak
+          description: Sidebar scoreboard - nick, status, clan, coins, kills/deaths
+          softdepend: [TpCoins, LuckPerms]
+
+          commands:
+            setclan:
+              description: Set player's clan (skeleton for future clan system)
+              usage: /setclan <nick> <clan or ->
+              permission: eclipsboard.setclan
+
+          permissions:
+            eclipsboard.setclan:
+              description: Set player's clan
+              default: op
+          EOF
+          mkdir -p $(dirname src/main/resources/config.yml)
+          cat > src/main/resources/config.yml <<'EOF'
+          # EclipsBoard. Цвета: & + код (&a, &c, &e ...)
+          # После обновления плагина удали старый config.yml, чтобы появились новые ключи.
+
+          server-name: "Eclips"
+
+          # Заголовок панели (над строками). Пробел = пусто.
+          title: " "
+
+          # Как часто обновлять панель (тики, 20 = 1 секунда)
+          update-ticks: 20
+          # Раз в сколько секунд полностью пересылать панель (на случай смены мира/измерения)
+          full-refresh-seconds: 10
+          # 0 = первая строка сверху, 1 = наоборот (если строки перевернутся - поменяй)
+          sort-order: 0
+
+          no-clan: "&7Нет клана"
+          default-status: "&7Игрок"
+
+          # Статус: сверху вниз, первое совпадение побеждает.
+          # Формат: "право|текст". Для групп LuckPerms право = group.<название группы>
+          statuses:
+            - "group.owner|&6Владелец"
+            - "group.admin|&cAdmin"
+            - "group.moder|&bМодератор"
+
+          # Строки панели. Пустая строка "" = отступ.
+          # Можно: {name} {status} {clan} {balance} {kills} {deaths} {server} {online}
+          lines:
+            - "&fНик: &e{name}"
+            - "&fСтатус: {status}"
+            - "&fКлан: {clan}"
+            - ""
+            - "&fБаланс: &6{balance}"
+            - ""
+            - "&fУ: &a{kills} &f| С: &b{deaths}"
+            - ""
+            - "&fСервер [&e{server}&f]"
+          EOF
+          mkdir -p $(dirname src/main/java/eclipsboard/EclipsBoard.java)
+          cat > src/main/java/eclipsboard/EclipsBoard.java <<'EOF'
+          package eclipsboard;
+
+          import cn.nukkit.Player;
+          import cn.nukkit.command.Command;
+          import cn.nukkit.command.CommandSender;
+          import cn.nukkit.entity.Entity;
+          import cn.nukkit.event.EventHandler;
+          import cn.nukkit.event.Listener;
+          import cn.nukkit.event.entity.EntityDamageByEntityEvent;
+          import cn.nukkit.event.entity.EntityDamageEvent;
+          import cn.nukkit.event.player.PlayerDeathEvent;
+          import cn.nukkit.event.player.PlayerJoinEvent;
+          import cn.nukkit.event.player.PlayerQuitEvent;
+          import cn.nukkit.network.protocol.SetDisplayObjectivePacket;
+          import cn.nukkit.network.protocol.SetScorePacket;
+          import cn.nukkit.plugin.Plugin;
+          import cn.nukkit.plugin.PluginBase;
+          import cn.nukkit.scheduler.Task;
+          import com.google.gson.Gson;
+          import com.google.gson.GsonBuilder;
+          import com.google.gson.reflect.TypeToken;
+
+          import java.io.File;
+          import java.io.Reader;
+          import java.io.Writer;
+          import java.lang.reflect.Field;
+          import java.lang.reflect.Type;
+          import java.nio.charset.StandardCharsets;
+          import java.nio.file.Files;
+          import java.util.ArrayList;
+          import java.util.Arrays;
+          import java.util.HashMap;
+          import java.util.HashSet;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.Map;
+          import java.util.Set;
+          import java.util.UUID;
+
+          public class EclipsBoard extends PluginBase implements Listener {
+
+              private static final String OBJECTIVE = "eclips";
+              private static EclipsBoard instance;
+
+              public static class PlayerData {
+                  public int kills;
+                  public int deaths;
+                  public String clan;
+              }
+
+              private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
+              private final Map<String, PlayerData> data = new HashMap<>();
+              private final Map<UUID, List<String>> shown = new HashMap<>();
+              private final Set<UUID> ready = new HashSet<>();
+              private File dataFile;
+              private boolean dirty;
+              private int counter;
+              private int fullEvery = 10;
+              private ClanProvider clanProvider;
+
+              public static EclipsBoard getInstance() {
+                  return instance;
+              }
+
+              /** Сюда потом можно подключить настоящую клан-систему. */
+              public void setClanProvider(ClanProvider provider) {
+                  this.clanProvider = provider;
+              }
+
+              @Override
+              public void onEnable() {
+                  instance = this;
+                  saveDefaultConfig();
+                  dataFile = new File(getDataFolder(), "data.json");
+                  loadData();
+
+                  clanProvider = player -> {
+                      PlayerData d = data.get(key(player.getName()));
+                      return d == null ? null : d.clan;
+                  };
+
+                  getServer().getPluginManager().registerEvents(this, this);
+
+                  final int period = Math.max(5, getConfig().getInt("update-ticks", 20));
+                  fullEvery = Math.max(1, getConfig().getInt("full-refresh-seconds", 10) * 20 / period);
+                  getServer().getScheduler().scheduleRepeatingTask(this, new Task() {
+                      @Override
+                      public void onRun(int currentTick) {
+                          tick();
+                      }
+                  }, period);
+
+                  for (Player p : getServer().getOnlinePlayers().values()) {
+                      data(p);
+                      ready.add(p.getUniqueId());
+                  }
+              }
+
+              @Override
+              public void onDisable() {
+                  saveData();
+              }
+
+              // ---------- события ----------
+
+              @EventHandler
+              public void onJoin(PlayerJoinEvent e) {
+                  final Player p = e.getPlayer();
+                  data(p);
+                  getServer().getScheduler().scheduleDelayedTask(this, new Task() {
+                      @Override
+                      public void onRun(int currentTick) {
+                          if (p.isOnline()) {
+                              ready.add(p.getUniqueId());
+                          }
+                      }
+                  }, 40);
+              }
+
+              @EventHandler
+              public void onQuit(PlayerQuitEvent e) {
+                  UUID id = e.getPlayer().getUniqueId();
+                  ready.remove(id);
+                  shown.remove(id);
+              }
+
+              @EventHandler
+              public void onDeath(PlayerDeathEvent e) {
+                  Entity ent = e.getEntity();
+                  if (!(ent instanceof Player)) {
+                      return;
+                  }
+                  Player victim = (Player) ent;
+                  data(victim).deaths++;
+                  dirty = true;
+                  EntityDamageEvent cause = victim.getLastDamageCause();
+                  if (cause instanceof EntityDamageByEntityEvent) {
+                      Entity damager = ((EntityDamageByEntityEvent) cause).getDamager();
+                      if (damager instanceof Player && damager != victim) {
+                          data((Player) damager).kills++;
+                      }
+                  }
+              }
+
+              // ---------- команда-заготовка для клана ----------
+
+              @Override
+              public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+                  if (!command.getName().equalsIgnoreCase("setclan")) {
+                      return false;
+                  }
+                  if (!sender.hasPermission("eclipsboard.setclan")) {
+                      sender.sendMessage("§cНет прав.");
+                      return true;
+                  }
+                  if (args.length < 2) {
+                      sender.sendMessage("§eИспользование: /setclan <ник> <клан или ->");
+                      return true;
+                  }
+                  String clan = String.join(" ", Arrays.copyOfRange(args, 1, args.length));
+                  PlayerData d = data.computeIfAbsent(key(args[0]), k -> new PlayerData());
+                  d.clan = clan.equals("-") ? null : clan;
+                  dirty = true;
+                  sender.sendMessage("§aКлан игрока " + args[0] + ": " + (d.clan == null ? "нет" : d.clan));
+                  return true;
+              }
+
+              // ---------- панель ----------
+
+              private void tick() {
+                  counter++;
+                  boolean full = counter % fullEvery == 0;
+                  for (Player p : getServer().getOnlinePlayers().values()) {
+                      if (p.isOnline() && ready.contains(p.getUniqueId())) {
+                          update(p, full);
+                      }
+                  }
+                  if (dirty && counter % 30 == 0) {
+                      saveData();
+                  }
+              }
+
+              private void update(Player p, boolean full) {
+                  List<String> lines = buildLines(p);
+                  UUID id = p.getUniqueId();
+                  List<String> old = shown.get(id);
+
+                  if (old == null || full) {
+                      sendDisplay(p);
+                  }
+
+                  List<SetScorePacket.ScoreInfo> remove = new ArrayList<>();
+                  List<SetScorePacket.ScoreInfo> set = new ArrayList<>();
+                  int max = Math.max(lines.size(), old == null ? 0 : old.size());
+                  for (int i = 0; i < max; i++) {
+                      String n = i < lines.size() ? lines.get(i) : null;
+                      String o = (old != null && i < old.size()) ? old.get(i) : null;
+                      if (o != null && (n == null || !o.equals(n))) {
+                          remove.add(new SetScorePacket.ScoreInfo(i, OBJECTIVE, i, o));
+                      }
+                      if (n != null && (full || o == null || !o.equals(n))) {
+                          set.add(new SetScorePacket.ScoreInfo(i, OBJECTIVE, i, n));
+                      }
+                  }
+                  sendScores(p, remove, true);
+                  sendScores(p, set, false);
+                  shown.put(id, lines);
+              }
+
+              private void sendDisplay(Player p) {
+                  SetDisplayObjectivePacket pk = new SetDisplayObjectivePacket();
+                  put(pk, "SIDEBAR", "displaySlot");
+                  put(pk, OBJECTIVE, "objectiveName");
+                  put(pk, color(getConfig().getString("title", " ")), "displayName");
+                  put(pk, "dummy", "criteria", "criteriaName");
+                  put(pk, getConfig().getInt("sort-order", 0), "sortOrder");
+                  p.dataPacket(pk);
+              }
+
+              /**
+               * Задаёт поле пакета через reflection: тип поля (String / enum / int) в разных
+               * версиях Nukkit отличается. value: строка или число (для enum число = номер значения).
+               */
+              private void put(Object target, Object value, String... names) {
+                  Field f = null;
+                  for (String n : names) {
+                      try {
+                          f = target.getClass().getField(n);
+                          break;
+                      } catch (NoSuchFieldException ignored) {
+                      }
+                  }
+                  if (f == null) {
+                      getLogger().warning("Нет поля пакета: " + names[0]);
+                      return;
+                  }
+                  try {
+                      Class<?> t = f.getType();
+                      if (t.isEnum()) {
+                          Object[] consts = t.getEnumConstants();
+                          if (value instanceof Number) {
+                              int idx = ((Number) value).intValue();
+                              if (idx >= 0 && idx < consts.length) {
+                                  f.set(target, consts[idx]);
+                              }
+                          } else {
+                              for (Object c : consts) {
+                                  if (((Enum<?>) c).name().equalsIgnoreCase(String.valueOf(value))) {
+                                      f.set(target, c);
+                                      break;
+                                  }
+                              }
+                          }
+                      } else if (t == String.class) {
+                          f.set(target, String.valueOf(value));
+                      } else if (t == int.class) {
+                          f.setInt(target, value instanceof Number ? ((Number) value).intValue() : 0);
+                      } else if (t == byte.class) {
+                          f.setByte(target, value instanceof Number ? ((Number) value).byteValue() : 0);
+                      }
+                  } catch (Exception ex) {
+                      getLogger().warning("Поле " + names[0] + ": " + ex);
+                  }
+              }
+
+              private void sendScores(Player p, List<SetScorePacket.ScoreInfo> infos, boolean remove) {
+                  if (infos.isEmpty()) {
+                      return;
+                  }
+                  SetScorePacket pk = new SetScorePacket();
+                  setAction(pk, remove);
+                  pk.infos = infos;
+                  p.dataPacket(pk);
+              }
+
+              /** action бывает byte или enum в разных версиях Nukkit - задаём через reflection. */
+              private void setAction(SetScorePacket pk, boolean remove) {
+                  try {
+                      Field f = SetScorePacket.class.getField("action");
+                      Class<?> t = f.getType();
+                      if (t.isEnum()) {
+                          String want = remove ? "REMOVE" : "SET";
+                          for (Object c : t.getEnumConstants()) {
+                              if (((Enum<?>) c).name().equals(want)) {
+                                  f.set(pk, c);
+                                  return;
+                              }
+                          }
+                      } else if (t == byte.class) {
+                          f.setByte(pk, (byte) (remove ? 1 : 0));
+                      } else if (t == int.class) {
+                          f.setInt(pk, remove ? 1 : 0);
+                      }
+                  } catch (Exception ex) {
+                      getLogger().warning("SetScorePacket.action: " + ex);
+                  }
+              }
+
+              private List<String> buildLines(Player p) {
+                  List<String> out = new ArrayList<>();
+                  Map<String, Integer> seen = new HashMap<>();
+                  for (String raw : getConfig().getStringList("lines")) {
+                      String s = color(fill(raw, p));
+                      if (s.isEmpty()) {
+                          s = " ";
+                      }
+                      int dup = seen.merge(s, 1, Integer::sum) - 1;
+                      StringBuilder sb = new StringBuilder(s);
+                      for (int i = 0; i < dup; i++) {
+                          sb.append("§r");
+                      }
+                      out.add(sb.toString());
+                  }
+                  return out;
+              }
+
+              private String fill(String raw, Player p) {
+                  PlayerData d = data(p);
+                  Long bal = balance(p);
+                  String clan = null;
+                  try {
+                      clan = clanProvider.getClan(p);
+                  } catch (Throwable ignored) {
+                  }
+                  if (clan == null || clan.isEmpty()) {
+                      clan = getConfig().getString("no-clan", "&7Нет клана");
+                  }
+                  String balText = bal == null ? "-" : String.format(Locale.US, "%,d", bal).replace(',', ' ');
+                  return raw.replace("{name}", p.getName())
+                          .replace("{status}", status(p))
+                          .replace("{clan}", clan)
+                          .replace("{balance}", balText)
+                          .replace("{kills}", String.valueOf(d.kills))
+                          .replace("{deaths}", String.valueOf(d.deaths))
+                          .replace("{server}", getConfig().getString("server-name", "Eclips"))
+                          .replace("{online}", String.valueOf(getServer().getOnlinePlayers().size()));
+              }
+
+              private String status(Player p) {
+                  for (String s : getConfig().getStringList("statuses")) {
+                      int i = s.indexOf('|');
+                      if (i < 1) {
+                          continue;
+                      }
+                      if (p.hasPermission(s.substring(0, i).trim())) {
+                          return s.substring(i + 1);
+                      }
+                  }
+                  return getConfig().getString("default-status", "&7Игрок");
+              }
+
+              /** Баланс из TpCoins: TpCoins.getEconomy().getBalance(ник). Через reflection, чтобы не зависеть от jar. */
+              private Long balance(Player p) {
+                  try {
+                      Plugin tp = getServer().getPluginManager().getPlugin("TpCoins");
+                      if (tp == null || !tp.isEnabled()) {
+                          return null;
+                      }
+                      Object eco = tp.getClass().getMethod("getEconomy").invoke(tp);
+                      Object r = eco.getClass().getMethod("getBalance", String.class).invoke(eco, key(p.getName()));
+                      return ((Number) r).longValue();
+                  } catch (Throwable t) {
+                      return null;
+                  }
+              }
+
+              // ---------- данные ----------
+
+              private PlayerData data(Player p) {
+                  return data.computeIfAbsent(key(p.getName()), k -> new PlayerData());
+              }
+
+              private static String key(String name) {
+                  return name.trim().toLowerCase(Locale.ROOT).replace(' ', '_');
+              }
+
+              private static String color(String s) {
+                  return s.replace('&', '§');
+              }
+
+              private void loadData() {
+                  if (!dataFile.exists()) {
+                      return;
+                  }
+                  try (Reader r = Files.newBufferedReader(dataFile.toPath(), StandardCharsets.UTF_8)) {
+                      Type type = new TypeToken<Map<String, PlayerData>>() {
+                      }.getType();
+                      Map<String, PlayerData> m = gson.fromJson(r, type);
+                      if (m != null) {
+                          data.putAll(m);
+                      }
+                  } catch (Exception e) {
+                      getLogger().warning("data.json: " + e);
+                  }
+              }
+
+              private void saveData() {
+                  try {
+                      getDataFolder().mkdirs();
+                      try (Writer w = Files.newBufferedWriter(dataFile.toPath(), StandardCharsets.UTF_8)) {
+                          gson.toJson(data, w);
+                      }
+                      dirty = false;
+                  } catch (Exception e) {
+                      getLogger().warning("save data.json: " + e);
+                  }
+              }
+          }
+          EOF
+          mkdir -p $(dirname src/main/java/eclipsboard/ClanProvider.java)
+          cat > src/main/java/eclipsboard/ClanProvider.java <<'EOF'
+          package eclipsboard;
+
+          import cn.nukkit.Player;
+
+          /**
+           * Скелет под клан-систему. Будущий плагин кланов вызывает
+           * EclipsBoard.getInstance().setClanProvider(player -> ...название клана или null...)
+           */
+          public interface ClanProvider {
+              String getClan(Player player);
+          }
+          EOF
+          mvn -B clean package
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: EclipsBoard-jar
+          path: EclipsBoard/target/EclipsBoard-1.0.0.jar
